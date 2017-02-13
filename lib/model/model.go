@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package model
 
@@ -106,7 +106,6 @@ var (
 	folderFactories = make(map[config.FolderType]folderFactory, 0)
 )
 
-// errors returned by the CheckFolderHealth method
 var (
 	errFolderPathEmpty     = errors.New("folder path empty")
 	errFolderPathMissing   = errors.New("folder path missing")
@@ -118,6 +117,8 @@ var (
 	errDevicePaused        = errors.New("device is paused")
 	errDeviceIgnored       = errors.New("device is ignored")
 	errNotRelative         = errors.New("not a relative path")
+	errFolderPaused        = errors.New("folder is paused")
+	errFolderMissing       = errors.New("no such folder")
 )
 
 // NewModel creates and starts a new model. The model starts in read-only mode,
@@ -485,6 +486,7 @@ type FolderCompletion struct {
 func (m *Model) Completion(device protocol.DeviceID, folder string) FolderCompletion {
 	m.fmut.RLock()
 	rf, ok := m.folderFiles[folder]
+	ignores := m.folderIgnores[folder]
 	m.fmut.RUnlock()
 	if !ok {
 		return FolderCompletion{} // Folder doesn't exist, so we hardly have any of it
@@ -504,6 +506,10 @@ func (m *Model) Completion(device protocol.DeviceID, folder string) FolderComple
 
 	var need, fileNeed, downloaded, deletes int64
 	rf.WithNeedTruncated(device, func(f db.FileIntf) bool {
+		if ignores.Match(f.FileName()).IsIgnored() {
+			return true
+		}
+
 		ft := f.(db.FileInfoTruncated)
 
 		// If the file is deleted, we account it only in the deleted column.
@@ -1705,14 +1711,15 @@ func (m *Model) ScanFolder(folder string) error {
 
 func (m *Model) ScanFolderSubdirs(folder string, subs []string) error {
 	m.fmut.Lock()
-	runner, ok := m.folderRunners[folder]
+	runner, okRunner := m.folderRunners[folder]
+	cfg, okCfg := m.folderCfgs[folder]
 	m.fmut.Unlock()
 
-	// Folders are added to folderRunners only when they are started. We can't
-	// scan them before they have started, so that's what we need to check for
-	// here.
-	if !ok {
-		return errors.New("no such folder")
+	if !okRunner {
+		if okCfg && cfg.Paused {
+			return errFolderPaused
+		}
+		return errFolderMissing
 	}
 
 	return runner.Scan(subs)
@@ -1760,11 +1767,11 @@ func (m *Model) internalScanFolderSubdirs(folder string, subDirs []string) error
 		}
 	}()
 
-	// Folders are added to folderRunners only when they are started. We can't
-	// scan them before they have started, so that's what we need to check for
-	// here.
 	if !ok {
-		return errors.New("no such folder")
+		if folderCfg.Paused {
+			return errFolderPaused
+		}
+		return errFolderMissing
 	}
 
 	if err := m.CheckFolderHealth(folder); err != nil {
@@ -2248,7 +2255,7 @@ func (m *Model) BringToFront(folder, file string) {
 func (m *Model) CheckFolderHealth(id string) error {
 	folder, ok := m.cfg.Folders()[id]
 	if !ok {
-		return errors.New("folder does not exist")
+		return errFolderMissing
 	}
 
 	// Check for folder errors, with the most serious and specific first and
